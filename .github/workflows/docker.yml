@@ -1,0 +1,122 @@
+# ==========================================================
+# GitHub Actions: React 프론트엔드 빌드 + Docker Hub push
+#
+# 위치: 07-2-react-memo-flyway/.github/workflows/docker.yml
+#       (GitHub 저장소: React_Flyway_GitActions)
+# 백엔드(08-3)의 maven.yml 과 같은 구조, JDK/Maven 대신 Node/npm 사용
+#
+# 흐름
+#   Pull Request → Checkout → Node 22 → npm ci + npm run build (빌드 오류 확인만)
+#   main 에 push → 위 과정 + Docker 이미지 빌드 → Docker Hub push
+#
+# 결과 이미지
+#   <Docker Hub 아이디>/boot-flyway-web:v1
+#   <Docker Hub 아이디>/boot-flyway-web:latest   ← EC2 compose 가 받는 태그
+#
+# 처음 한 번 필요한 설정 (GitHub 저장소 Settings > Secrets and variables > Actions)
+#   DOCKER_USERNAME : Docker Hub 아이디
+#   DOCKER_PASSWORD : Docker Hub Access Token (Read & Write 권한)
+#   (백엔드 저장소와 같은 값이어도 저장소마다 따로 등록해야 함)
+#
+# 실행 결과 확인: GitHub 저장소의 Actions 탭
+# ==========================================================
+
+# 워크플로 이름 (Actions 탭 목록에 표시)
+name: React CI with Docker
+
+# ----------------------------------------------------------
+# 실행 조건 (트리거)
+# ----------------------------------------------------------
+on:
+  # main 브랜치에 커밋이 push 될 때 (PR 이 병합될 때도 실행됨)
+  push:
+    branches: [ "main" ]
+  # main 으로 병합하려는 Pull Request 를 만들거나 수정할 때 (병합 전 빌드 확인)
+  pull_request:
+    branches: [ "main" ]
+
+# ----------------------------------------------------------
+# 워크플로 전체에서 쓰는 변수 (${{ env.이름 }} 으로 사용)
+# ----------------------------------------------------------
+env:
+  DOCKER_IMAGE: boot-flyway-web   # Docker Hub 저장소 이름 (소문자만 가능, 백엔드는 boot-flyway-app)
+  DOCKER_TAG: v1                  # 버전 태그 (새 버전을 구분해 남기고 싶으면 v2, v3 ... 로 변경)
+
+jobs:
+  build:
+    # 실행 환경: GitHub 이 제공하는 Ubuntu 가상 머신 (실행할 때마다 새 머신)
+    # - x86(amd64) 머신이므로 이미지도 x86 용 → EC2 도 x86 인스턴스 사용
+    runs-on: ubuntu-latest
+
+    # 순서대로 실행, 한 단계라도 실패하면 뒤 단계는 실행되지 않음
+    steps:
+
+      # 1. 저장소 코드를 가상 머신으로 내려받기 (git clone 과 같은 역할)
+      #    - 이 단계가 없으면 package.json, Dockerfile, src 가 없어서 뒤 단계가 모두 실패
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Node 22 설치 + npm 캐시
+      #    - node-version: Dockerfile 의 빌드 이미지(node:22-alpine)와 같은 버전으로 맞춤
+      #    - cache: npm = npm 다운로드 캐시(~/.npm)를 GitHub 캐시에 저장
+      #      → package-lock.json 이 그대로면 다음 실행에서 다시 내려받지 않음
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # 3. 빌드 확인 (JSX 문법 오류, import 경로 오류 등이 있으면 여기서 실패)
+      #    - npm ci : package-lock.json 에 적힌 버전 그대로 설치 (npm install 과 달리 lock 파일을 바꾸지 않음, CI 용)
+      #    - npm run build : vite build → dist 폴더 생성
+      #    - run: | 는 여러 줄 명령을 순서대로 실행 (앞 명령이 실패하면 중단)
+      #    - 참고: 실제 이미지의 dist 는 Dockerfile 안에서 다시 빌드되므로, 이 단계는 "빠른 오류 확인" 용도
+      - name: Build
+        run: |
+          npm ci
+          npm run build
+
+      # ---- 아래 3단계는 main 에 push 될 때만 실행 ----
+      # if: github.event_name == 'push'
+      #   - Pull Request 에서는 실행하지 않음 (검토 전 코드는 배포하지 않음)
+      #   - fork 저장소에서 온 PR 은 secrets 를 읽을 수 없어 로그인 단계가 실패하기 때문이기도 함
+
+      # 4. Docker 이미지 빌드 도구(Buildx) 준비
+      #    - GitHub 캐시(type=gha)에 빌드 레이어를 저장하려면 필요
+      - name: Set up Docker Buildx
+        if: github.event_name == 'push'
+        uses: docker/setup-buildx-action@v3
+
+      # 5. Docker Hub 로그인
+      #    - secrets.XXX : 저장소 Settings > Secrets 에 등록한 값 (로그에는 *** 로 표시)
+      - name: Login to Docker Hub
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}   # Access Token 권장
+
+      # 6. Dockerfile 로 이미지를 빌드하고 Docker Hub 에 push
+      #    - Dockerfile 은 멀티 스테이지: node:22-alpine 으로 npm run build → nginx:alpine 이 dist 제공
+      #    - 백엔드 주소(BACKEND_URL)는 이미지에 넣지 않음 → EC2 의 compose.yaml 에서 실행할 때 지정
+      - name: Build & push Docker image
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v6
+        with:
+          # 빌드 기준 폴더 (docker build . 의 . 과 같음)
+          # - file 을 생략하면 이 폴더의 Dockerfile 을 사용
+          # - .dockerignore 로 node_modules, dist 는 제외됨
+          context: .
+          # true: 빌드 후 Docker Hub 에 업로드
+          push: true
+          # 이미지 이름:태그 (같은 이미지에 태그 2개)
+          # - :v1     → 버전 기록용 (되돌릴 때 사용)
+          # - :latest → 항상 마지막 빌드, EC2 compose 가 기본으로 받는 태그
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE }}:latest
+          # 빌드 캐시 (GitHub Actions 캐시 저장소)
+          # - cache-from: 이전 빌드 레이어 재사용 → package.json 이 그대로면 npm ci 단계 생략
+          # - cache-to  : 이번 빌드 레이어 저장, mode=max 는 빌드 스테이지(node)까지 모두 저장
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
